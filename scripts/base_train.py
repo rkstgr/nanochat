@@ -26,6 +26,7 @@ import torch
 import torch.distributed as dist
 
 from nanochat.gpt import GPT, GPTConfig, Linear
+from nanochat.atlas import Atlas, AtlasConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
@@ -47,6 +48,7 @@ parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (e
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU and torchao)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
 # Model architecture
+parser.add_argument("--model", type=str, default="gpt", choices=["gpt", "atlas"], help="model architecture to train")
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
@@ -126,20 +128,30 @@ print0(f"Vocab size: {vocab_size:,}")
 # -----------------------------------------------------------------------------
 # Initialize the Model
 
-def build_model_meta(depth):
+def build_model_meta(depth, model_type=None):
     """Build a model on meta device for a given depth (shapes/dtypes only, no data)."""
+    if model_type is None:
+        model_type = args.model
     # Model dim is nudged up to nearest multiple of head_dim for clean division
     # (FA3 requires head_dim divisible by 8, and this guarantees head_dim == args.head_dim exactly)
     base_dim = depth * args.aspect_ratio
     model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
     num_heads = model_dim // args.head_dim
-    config = GPTConfig(
-        sequence_len=args.max_seq_len, vocab_size=vocab_size,
-        n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
-        window_pattern=args.window_pattern,
-    )
-    with torch.device("meta"):
-        model_meta = GPT(config)
+    if model_type == "atlas":
+        config = AtlasConfig(
+            sequence_len=args.max_seq_len, vocab_size=vocab_size,
+            n_layer=depth, n_head=num_heads, n_embd=model_dim,
+        )
+        with torch.device("meta"):
+            model_meta = Atlas(config)
+    else:
+        config = GPTConfig(
+            sequence_len=args.max_seq_len, vocab_size=vocab_size,
+            n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
+            window_pattern=args.window_pattern,
+        )
+        with torch.device("meta"):
+            model_meta = GPT(config)
     return model_meta
 
 # Build the model, move to device, init the weights
@@ -268,8 +280,8 @@ def get_scaling_params(m):
 num_scaling_params = get_scaling_params(model)
 target_tokens = int(args.target_param_data_ratio * num_scaling_params) # optimal tokens for the model we are about to train
 
-# Our reference model is d12, this is where a lot of hyperparameters are tuned and then transfered to higher depths (muP style)
-d12_ref = build_model_meta(12) # creates the model on meta device
+# Our reference model is d12 GPT, this is where a lot of hyperparameters are tuned and then transfered to higher depths (muP style)
+d12_ref = build_model_meta(12, model_type="gpt") # always GPT for scaling law reference
 D_REF = args.target_param_data_ratio * get_scaling_params(d12_ref) # compute-optimal d12 training horizon in tokens (measured empirically)
 B_REF = 2**19 # optimal batch size at d12 ~= 524,288 tokens (measured empirically)
 
@@ -465,12 +477,19 @@ while True:
             "My favorite color is",
             "If 5*x + 3 = 13, then x is",
         ]
-        engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
-        for prompt in prompts:
-            tokens = tokenizer(prompt, prepend="<|bos|>")
-            with disable_fp8(orig_model):
-                sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
-            print0(tokenizer.decode(sample[0]))
+        with disable_fp8(orig_model):
+            if args.model == "atlas":
+                # Atlas has its own generate method (recurrent, no KVCache)
+                for prompt in prompts:
+                    tokens = tokenizer(prompt, prepend="<|bos|>")
+                    gen_tokens = list(orig_model.generate(tokens, max_tokens=16, temperature=0))
+                    print0(tokenizer.decode(tokens + gen_tokens))
+            else:
+                engine = Engine(orig_model, tokenizer)
+                for prompt in prompts:
+                    tokens = tokenizer(prompt, prepend="<|bos|>")
+                    sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
+                    print0(tokenizer.decode(sample[0]))
         model.train()
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step

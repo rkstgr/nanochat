@@ -10,6 +10,7 @@ import torch
 
 from nanochat.common import get_base_dir
 from nanochat.gpt import GPT, GPTConfig
+from nanochat.atlas import Atlas, AtlasConfig
 from nanochat.tokenizer import get_tokenizer
 from nanochat.common import setup_default_logging
 
@@ -95,10 +96,16 @@ def build_model(checkpoint_dir, step, device, phase):
     model_config_kwargs = meta_data["model_config"]
     _patch_missing_config_keys(model_config_kwargs)
     log0(f"Building model with config: {model_config_kwargs}")
-    model_config = GPTConfig(**model_config_kwargs)
-    _patch_missing_keys(model_data, model_config)
-    with torch.device("meta"):
-        model = GPT(model_config)
+    # Detect model type from saved config (Atlas configs have 'chunk_size', GPT configs have 'n_kv_head')
+    if "chunk_size" in model_config_kwargs:
+        model_config = AtlasConfig(**model_config_kwargs)
+        with torch.device("meta"):
+            model = Atlas(model_config)
+    else:
+        model_config = GPTConfig(**model_config_kwargs)
+        _patch_missing_keys(model_data, model_config)
+        with torch.device("meta"):
+            model = GPT(model_config)
     # Load the model state
     model.to_empty(device=device)
     model.init_weights() # note: this is dumb, but we need to init the rotary embeddings. TODO: fix model re-init

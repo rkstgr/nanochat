@@ -236,24 +236,40 @@ def main():
                 "My favorite color is",
                 "If 5*x + 3 = 13, then x is",
             ]
-            engine = Engine(model, tokenizer)
+            # Atlas has its own generate (recurrent, no KVCache); GPT uses Engine
+            from nanochat.atlas import Atlas
+            is_atlas = isinstance(model, Atlas)
+            if not is_atlas:
+                engine = Engine(model, tokenizer)
             print0("\nConditioned samples:")
             for prompt in prompts:
                 tokens = tokenizer(prompt, prepend="<|bos|>")
-                sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
-                sample_str = tokenizer.decode(sample[0])
+                if is_atlas:
+                    gen_tokens = list(model.generate(tokens, max_tokens=16, temperature=0))
+                    sample_str = tokenizer.decode(tokens + gen_tokens)
+                else:
+                    sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
+                    sample_str = tokenizer.decode(sample[0])
                 print0("-" * 80)
                 print0(sample_str)
                 samples.append(sample_str)
 
             print0("\nUnconditioned samples:")
             tokens = tokenizer("", prepend="<|bos|>")
-            uncond, _ = engine.generate_batch(tokens, num_samples=8, max_tokens=128, temperature=1.0)
-            for sample in uncond:
-                sample_str = tokenizer.decode(sample)
-                print0("-" * 80)
-                print0(sample_str)
-                unconditioned_samples.append(sample_str)
+            if is_atlas:
+                for _ in range(8):
+                    gen_tokens = list(model.generate(tokens, max_tokens=128, temperature=1.0))
+                    sample_str = tokenizer.decode(tokens + gen_tokens)
+                    print0("-" * 80)
+                    print0(sample_str)
+                    unconditioned_samples.append(sample_str)
+            else:
+                uncond, _ = engine.generate_batch(tokens, num_samples=8, max_tokens=128, temperature=1.0)
+                for sample in uncond:
+                    sample_str = tokenizer.decode(sample)
+                    print0("-" * 80)
+                    print0(sample_str)
+                    unconditioned_samples.append(sample_str)
     elif 'sample' in eval_modes and is_hf_model:
         print0("\nSkipping sampling for HuggingFace models (not supported)")
 
