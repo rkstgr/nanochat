@@ -26,6 +26,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
 from nanochat.optim import MuonAdamW, DistMuonAdamW
@@ -137,6 +138,42 @@ class AtlasMemoryLayer(nn.Module):
         self.gate_eta = Linear(config.n_embd, config.n_head, bias=False)
         self.gate_theta = Linear(config.n_embd, config.n_head, bias=False)
 
+    @staticmethod
+    def _process_chunk(M, S, q_c, k_c, v_c, a_c, e_c, t_c, ns_steps):
+        """Process a single chunk: gradient, momentum scan, polar express, memory scan.
+        Extracted as a static method so it can be wrapped with torch.utils.checkpoint."""
+        cs = q_c.shape[1]
+
+        # --- Parallel: compute gradients u_t w.r.t. frozen memory M ---
+        # pred_t = M @ k_t  (memory retrieval with current keys)
+        pred = torch.einsum('bhvk,bchk->bchv', M, k_c)
+        err = pred - v_c
+        u = 2.0 * torch.einsum('bchv,bchk->bchvk', err, k_c)   # outer product
+
+        # --- Sequential: momentum scan within chunk ---
+        # S_t = theta_t * S_{t-1} - eta_t * u_t
+        # NOTE: we collect into a list and torch.stack to preserve the autograd graph
+        # (in-place assignment into torch.empty would sever gradient flow)
+        chunk_S_list = []
+        for t in range(cs):
+            S = t_c[:, t].unsqueeze(-1) * S - e_c[:, t].unsqueeze(-1) * u[:, t]
+            chunk_S_list.append(S)
+        chunk_S = torch.stack(chunk_S_list, dim=1)  # (B, cs, H, D, D)
+
+        # --- Parallel: Polar Express orthogonalization on all momentum matrices ---
+        chunk_S_orth = polar_express(chunk_S, ns_steps)
+
+        # --- Sequential: memory scan + output ---
+        # M_t = alpha_t * M_{t-1} + PolarExpress(S_t)
+        # y_t = M_t @ q_t
+        y_c_list = []
+        for t in range(cs):
+            M = a_c[:, t].unsqueeze(-1) * M + chunk_S_orth[:, t]
+            y_c_list.append(torch.einsum('bhvk,bhk->bhv', M, q_c[:, t]))
+        y_c = torch.stack(y_c_list, dim=1)  # (B, cs, H, D)
+
+        return y_c, M, S
+
     def forward(self, x, memory_state=None):
         B, T, C = x.shape
         H, D = self.n_head, self.head_dim
@@ -182,33 +219,15 @@ class AtlasMemoryLayer(nn.Module):
             q_c, k_c, v_c = q[:, s:e], k[:, s:e], v[:, s:e]
             a_c, e_c, t_c = alpha[:, s:e], eta[:, s:e], theta[:, s:e]
 
-            # --- Parallel: compute gradients u_t w.r.t. frozen memory M ---
-            # pred_t = M @ k_t  (memory retrieval with current keys)
-            pred = torch.einsum('bhvk,bchk->bchv', M, k_c)
-            err = pred - v_c
-            u = 2.0 * torch.einsum('bchv,bchk->bchvk', err, k_c)   # outer product
-
-            # --- Sequential: momentum scan within chunk ---
-            # S_t = theta_t * S_{t-1} - eta_t * u_t
-            # NOTE: we collect into a list and torch.stack to preserve the autograd graph
-            # (in-place assignment into torch.empty would sever gradient flow)
-            chunk_S_list = []
-            for t in range(cs):
-                S = t_c[:, t].unsqueeze(-1) * S - e_c[:, t].unsqueeze(-1) * u[:, t]
-                chunk_S_list.append(S)
-            chunk_S = torch.stack(chunk_S_list, dim=1)  # (B, cs, H, D, D)
-
-            # --- Parallel: Polar Express orthogonalization on all momentum matrices ---
-            chunk_S_orth = polar_express(chunk_S, self.ns_steps)
-
-            # --- Sequential: memory scan + output (fused to avoid storing all M_t) ---
-            # M_t = alpha_t * M_{t-1} + PolarExpress(S_t)
-            # y_t = M_t @ q_t
-            y_c_list = []
-            for t in range(cs):
-                M = a_c[:, t].unsqueeze(-1) * M + chunk_S_orth[:, t]
-                y_c_list.append(torch.einsum('bhvk,bhk->bhv', M, q_c[:, t]))
-            y_c = torch.stack(y_c_list, dim=1)  # (B, cs, H, D)
+            # Checkpoint the entire chunk: during backward, only M and S (the inputs)
+            # are stored at chunk boundaries; all intra-chunk intermediates (gradient
+            # tensor u, momentum scan states, polar express iterations, memory scan
+            # states) are recomputed. This reduces activation memory from O(n_chunks *
+            # chunk_size * H * D²) to O(n_chunks * H * D²).
+            y_c, M, S = checkpoint(
+                self._process_chunk, M, S, q_c, k_c, v_c, a_c, e_c, t_c, self.ns_steps,
+                use_reentrant=False,
+            )
 
             outputs.append(y_c)
 
