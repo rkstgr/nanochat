@@ -29,6 +29,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
+from nanochat.atlas_kernels import fused_linear_scan, fused_polar_express
 from nanochat.optim import MuonAdamW, DistMuonAdamW
 
 
@@ -142,35 +143,29 @@ class AtlasMemoryLayer(nn.Module):
     def _process_chunk(M, S, q_c, k_c, v_c, a_c, e_c, t_c, ns_steps):
         """Process a single chunk: gradient, momentum scan, polar express, memory scan.
         Extracted as a static method so it can be wrapped with torch.utils.checkpoint."""
-        cs = q_c.shape[1]
-
         # --- Parallel: compute gradients u_t w.r.t. frozen memory M ---
         # pred_t = M @ k_t  (memory retrieval with current keys)
         pred = torch.einsum('bhvk,bchk->bchv', M, k_c)
         err = pred - v_c
         u = 2.0 * torch.einsum('bchv,bchk->bchvk', err, k_c)   # outer product
 
-        # --- Sequential: momentum scan within chunk ---
+        # --- Fused momentum scan (replaces Python for-loop) ---
         # S_t = theta_t * S_{t-1} - eta_t * u_t
-        # NOTE: we collect into a list and torch.stack to preserve the autograd graph
-        # (in-place assignment into torch.empty would sever gradient flow)
-        chunk_S_list = []
-        for t in range(cs):
-            S = t_c[:, t].unsqueeze(-1) * S - e_c[:, t].unsqueeze(-1) * u[:, t]
-            chunk_S_list.append(S)
-        chunk_S = torch.stack(chunk_S_list, dim=1)  # (B, cs, H, D, D)
+        # Rewrite as: S_t = theta_t * S_{t-1} + (-eta_t * u_t)
+        theta = t_c.squeeze(-1)                          # (B, cs, H)
+        momentum_input = -(e_c.unsqueeze(-1) * u)        # (B, cs, H, D, D)
+        chunk_S, S = fused_linear_scan(S, theta, momentum_input)
 
-        # --- Parallel: Polar Express orthogonalization on all momentum matrices ---
-        chunk_S_orth = polar_express(chunk_S, ns_steps)
+        # --- Polar Express orthogonalization (fused Triton kernel when available) ---
+        chunk_S_orth = fused_polar_express(chunk_S, ns_steps)
 
-        # --- Sequential: memory scan + output ---
+        # --- Fused memory scan (replaces Python for-loop) ---
         # M_t = alpha_t * M_{t-1} + PolarExpress(S_t)
-        # y_t = M_t @ q_t
-        y_c_list = []
-        for t in range(cs):
-            M = a_c[:, t].unsqueeze(-1) * M + chunk_S_orth[:, t]
-            y_c_list.append(torch.einsum('bhvk,bhk->bhv', M, q_c[:, t]))
-        y_c = torch.stack(y_c_list, dim=1)  # (B, cs, H, D)
+        alpha = a_c.squeeze(-1)                           # (B, cs, H)
+        M_all, M = fused_linear_scan(M, alpha, chunk_S_orth)
+
+        # --- Parallel: output y = M_t @ q_t for all timesteps ---
+        y_c = torch.einsum('bchvk,bchk->bchv', M_all, q_c)
 
         return y_c, M, S
 
@@ -343,8 +338,15 @@ class Atlas(nn.Module):
         nparams_exclude = self.transformer.wte.weight.numel()  # embedding is a lookup, not a matmul
         H = self.config.n_head
         D = self.config.n_embd // H
-        # Per-token per-layer memory ops: gradient(2HD²) + momentum scan(HD²) + NS5(3*ns*HD²) + memory scan(HD²) + read(HD²)
-        memory_flops_per_token = H * D * D * (5 + 3 * self.config.ns_steps)
+        # Per-token per-layer memory ops:
+        #   gradient: 2*H*D² (M@k matvec + outer product)
+        #   momentum scan: H*D² (element-wise on D×D state)
+        #   polar express: 3 matmuls/step × ns_steps × 2*H*D³ (D×D matrix multiplies)
+        #   memory scan: H*D² (element-wise on D×D state)
+        #   output: 2*H*D² (M@q matvec)
+        elementwise_flops = H * D * D * 5   # gradient + scans + output
+        ns_flops = 3 * self.config.ns_steps * 2 * H * D * D * D  # polar express matmuls
+        memory_flops_per_token = elementwise_flops + ns_flops
         total_memory_flops = memory_flops_per_token * self.config.n_layer
         return 6 * (nparams - nparams_exclude) + total_memory_flops
 

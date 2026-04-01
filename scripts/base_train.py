@@ -53,6 +53,8 @@ parser.add_argument("--depth", type=int, default=20, help="depth of the Transfor
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
+parser.add_argument("--chunk-size", type=int, default=64, help="Atlas: tokens per chunk for memory computation")
+parser.add_argument("--ns-steps", type=int, default=5, help="Atlas: Polar Express Newton-Schulz iterations")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
@@ -141,6 +143,7 @@ def build_model_meta(depth, model_type=None):
         config = AtlasConfig(
             sequence_len=args.max_seq_len, vocab_size=vocab_size,
             n_layer=depth, n_head=num_heads, n_embd=model_dim,
+            chunk_size=args.chunk_size, ns_steps=args.ns_steps,
         )
         with torch.device("meta"):
             model_meta = Atlas(config)
@@ -255,7 +258,16 @@ def disable_fp8(model):
 # Compile the model
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+if args.model == "atlas":
+    # Atlas chunk loop (32 iterations with checkpoint) is too complex for full-model compile.
+    # Instead, compile just the per-chunk processing function for kernel fusion.
+    from nanochat.atlas import AtlasMemoryLayer
+    AtlasMemoryLayer._process_chunk = staticmethod(
+        torch.compile(AtlasMemoryLayer._process_chunk, dynamic=False)
+    )
+    model = model
+else:
+    model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
