@@ -55,6 +55,11 @@ parser.add_argument("--head-dim", type=int, default=128, help="target head dimen
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--chunk-size", type=int, default=64, help="Atlas: tokens per chunk for memory computation")
 parser.add_argument("--ns-steps", type=int, default=5, help="Atlas: Polar Express Newton-Schulz iterations")
+parser.add_argument("--omega-window", type=int, default=16, help="Atlas: Omega rule sliding window size (1=online/Delta rule)")
+parser.add_argument("--poly-degree", type=int, default=3, help="Atlas: polynomial feature mapping degree (0=disabled)")
+parser.add_argument("--deep-memory", type=int, default=1, help="Atlas: use deep MLP memory (1) vs linear matrix (0)")
+parser.add_argument("--memory-expand", type=int, default=1, help="Atlas: MLP expansion factor for deep memory")
+parser.add_argument("--pe-ste", type=int, default=0, help="Atlas: Polar Express straight-through estimator (skip PE backward)")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
@@ -144,6 +149,9 @@ def build_model_meta(depth, model_type=None):
             sequence_len=args.max_seq_len, vocab_size=vocab_size,
             n_layer=depth, n_head=num_heads, n_embd=model_dim,
             chunk_size=args.chunk_size, ns_steps=args.ns_steps,
+            omega_window=args.omega_window, poly_degree=args.poly_degree,
+            deep_memory=bool(args.deep_memory), memory_expand=args.memory_expand,
+            pe_ste=bool(args.pe_ste),
         )
         with torch.device("meta"):
             model_meta = Atlas(config)
@@ -264,6 +272,9 @@ if args.model == "atlas":
     from nanochat.atlas import AtlasMemoryLayer
     AtlasMemoryLayer._process_chunk = staticmethod(
         torch.compile(AtlasMemoryLayer._process_chunk, dynamic=False)
+    )
+    AtlasMemoryLayer._process_chunk_deep = staticmethod(
+        torch.compile(AtlasMemoryLayer._process_chunk_deep, dynamic=False)
     )
     model = model
 else:

@@ -2,16 +2,18 @@
 Atlas: Learning to Optimally Memorize the Context at Test Time
 arXiv: 2505.23735
 
-A recurrent architecture that replaces attention with a linear memory module
+A recurrent architecture that replaces attention with a deep memory module
 updated by the Omega rule with Muon-style optimizer (Newton-Schulz / Polar Express
 orthogonalization).
 
 Key features:
-- Linear (matrix-valued) memory per head, updated via Omega rule
+- Deep MLP memory per head (2-layer with residual), or linear matrix memory (configurable)
+- Omega rule: sliding window gradient aggregation with per-token context gates (γ_i)
+- Polynomial feature mapping on keys/queries (learnable coefficients ≈ Taylor of exp)
 - Polar Express orthogonalization for locally optimal memory management
-- Input-dependent forgetting, learning rate, and momentum gates
+- Input-dependent forgetting (α), learning rate (η), momentum (θ), and context (γ) gates
 - Short causal convolution on Q, K, V projections
-- Chunk-parallel computation for efficient training
+- Chunk-parallel computation for efficient training with gradient checkpointing
 - No positional encoding needed (recurrent by nature)
 
 Notable differences from nanochat GPT (gpt.py):
@@ -21,6 +23,7 @@ Notable differences from nanochat GPT (gpt.py):
 - Memory state carries across sequence positions (and optionally across calls for inference)
 """
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -29,7 +32,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
-from nanochat.atlas_kernels import fused_linear_scan, fused_polar_express
+from nanochat.atlas_kernels import fused_linear_scan, fused_polar_express, polar_express_ste
 from nanochat.optim import MuonAdamW, DistMuonAdamW
 
 
@@ -43,6 +46,11 @@ class AtlasConfig:
     chunk_size: int = 64    # tokens per chunk for parallel memory computation
     conv_kernel: int = 4    # short causal convolution kernel size
     ns_steps: int = 5       # Polar Express orthogonalization iterations
+    omega_window: int = 16  # Omega rule sliding window size (1 = online/Delta rule)
+    poly_degree: int = 3    # polynomial feature mapping degree (0 = disabled)
+    deep_memory: bool = True   # deep MLP memory vs linear matrix memory
+    memory_expand: int = 1     # MLP expansion factor for deep memory (1 = D×D weights)
+    pe_ste: bool = False       # Polar Express straight-through estimator (skip PE backward)
 
 
 def norm(x):
@@ -83,6 +91,37 @@ def polar_express(X, steps=5):
     return X
 
 
+def _gelu_derivative(x):
+    """Exact derivative of GELU(x) = x * Φ(x) where Φ is the standard normal CDF."""
+    cdf = 0.5 * (1.0 + torch.erf(x * 0.7071067811865476))
+    pdf = torch.exp(-0.5 * x * x) * 0.3989422804014327
+    return cdf + x * pdf
+
+
+def _omega_aggregate(u, gamma, omega_window):
+    """Sliding window aggregation with per-position context gates (Omega rule).
+
+    For each position t, computes: Σ_{i=max(0,t-w+1)}^{t} γ_i * u_i
+    Uses cumsum for O(n) computation instead of O(n*w).
+
+    Args:
+        u: (B, cs, H, ...) per-position gradient values
+        gamma: (B, cs, H, 1) per-position context gates
+        omega_window: sliding window size
+    """
+    cs = u.shape[1]
+    g = gamma
+    while g.ndim < u.ndim:
+        g = g.unsqueeze(-1)
+    weighted = g * u
+    cum = torch.cumsum(weighted, dim=1)
+    if omega_window >= cs:
+        return cum
+    result = cum.clone()
+    result[:, omega_window:] = cum[:, omega_window:] - cum[:, :-omega_window]
+    return result
+
+
 class ShortConv(nn.Module):
     """Causal depthwise 1D convolution (per Titans / Based convention)."""
     def __init__(self, dim, kernel_size=4):
@@ -120,7 +159,15 @@ class AtlasMemoryLayer(nn.Module):
         self.head_dim = config.n_embd // config.n_head
         self.chunk_size = config.chunk_size
         self.ns_steps = config.ns_steps
+        self.omega_window = config.omega_window
+        self.poly_degree = config.poly_degree
+        self.deep_memory = config.deep_memory
+        self.memory_expand = config.memory_expand
+        self.expand_dim = self.memory_expand * self.head_dim if self.deep_memory else self.head_dim
+        self.pe_ste = config.pe_ste
         assert config.n_embd % config.n_head == 0
+        assert config.omega_window <= config.chunk_size, \
+            f"omega_window ({config.omega_window}) must be <= chunk_size ({config.chunk_size})"
 
         # Input projections
         self.c_q = Linear(config.n_embd, config.n_embd, bias=False)
@@ -139,27 +186,51 @@ class AtlasMemoryLayer(nn.Module):
         self.gate_eta = Linear(config.n_embd, config.n_head, bias=False)
         self.gate_theta = Linear(config.n_embd, config.n_head, bias=False)
 
+        # Omega rule: per-token context gates within the sliding window
+        if self.omega_window > 1:
+            self.gate_gamma = Linear(config.n_embd, config.n_head, bias=False)
+
+        # Polynomial feature mapping: learnable coefficients initialized at 1/i!
+        if self.poly_degree > 0:
+            coeffs = [1.0 / math.factorial(i) for i in range(1, self.poly_degree + 1)]
+            self.poly_coeffs = nn.Parameter(torch.tensor(coeffs))
+
+    def _poly_features(self, x):
+        """Element-wise polynomial feature mapping: φ(x) = Σ_{i=1}^{p} a_i * x^i.
+        Learnable coefficients approximate the Taylor expansion of exp(q^T k)."""
+        result = self.poly_coeffs[0] * x
+        x_pow = x
+        for i in range(1, self.poly_degree):
+            x_pow = x_pow * x
+            result = result + self.poly_coeffs[i] * x_pow
+        return result
+
     @staticmethod
-    def _process_chunk(M, S, q_c, k_c, v_c, a_c, e_c, t_c, ns_steps):
-        """Process a single chunk: gradient, momentum scan, polar express, memory scan.
+    def _process_chunk(M, S, q_c, k_c, v_c, a_c, e_c, t_c, g_c, ns_steps, omega_window,
+                       use_pe_ste):
+        """Process a single chunk with linear memory: gradient, momentum scan, polar express, memory scan.
         Extracted as a static method so it can be wrapped with torch.utils.checkpoint."""
-        # --- Parallel: compute gradients u_t w.r.t. frozen memory M ---
-        # pred_t = M @ k_t  (memory retrieval with current keys)
+        _pe = polar_express_ste if use_pe_ste else fused_polar_express
+
+        # --- Parallel: compute per-position gradients w.r.t. frozen memory M ---
         pred = torch.einsum('bhvk,bchk->bchv', M, k_c)
         err = pred - v_c
         u = 2.0 * torch.einsum('bchv,bchk->bchvk', err, k_c)   # outer product
 
-        # --- Fused momentum scan (replaces Python for-loop) ---
+        # --- Omega rule: sliding window aggregation with context gates ---
+        if omega_window > 1 and g_c is not None:
+            u = _omega_aggregate(u, g_c, omega_window)
+
+        # --- Fused momentum scan ---
         # S_t = theta_t * S_{t-1} - eta_t * u_t
-        # Rewrite as: S_t = theta_t * S_{t-1} + (-eta_t * u_t)
         theta = t_c.squeeze(-1)                          # (B, cs, H)
         momentum_input = -(e_c.unsqueeze(-1) * u)        # (B, cs, H, D, D)
         chunk_S, S = fused_linear_scan(S, theta, momentum_input)
 
-        # --- Polar Express orthogonalization (fused Triton kernel when available) ---
-        chunk_S_orth = fused_polar_express(chunk_S, ns_steps)
+        # --- Polar Express orthogonalization ---
+        chunk_S_orth = _pe(chunk_S, ns_steps)
 
-        # --- Fused memory scan (replaces Python for-loop) ---
+        # --- Fused memory scan ---
         # M_t = alpha_t * M_{t-1} + PolarExpress(S_t)
         alpha = a_c.squeeze(-1)                           # (B, cs, H)
         M_all, M = fused_linear_scan(M, alpha, chunk_S_orth)
@@ -169,9 +240,60 @@ class AtlasMemoryLayer(nn.Module):
 
         return y_c, M, S
 
+    @staticmethod
+    def _process_chunk_deep(W1, W2, S_W1, S_W2, q_c, k_c, v_c, a_c, e_c, t_c, g_c,
+                            ns_steps, omega_window, use_pe_ste):
+        """Process a single chunk with deep MLP memory.
+        Memory is a 2-layer MLP: M(x) = x + W1 @ GELU(W2 @ x) with residual connection.
+        State consists of (W1, W2) weights and (S_W1, S_W2) momentum matrices."""
+        _pe = polar_express_ste if use_pe_ste else fused_polar_express
+
+        # --- Forward through frozen MLP memory ---
+        h = torch.einsum('bhed,bchd->bche', W2, k_c)      # (B, cs, H, E)
+        act = F.gelu(h)                                      # (B, cs, H, E)
+        y_pred = k_c + torch.einsum('bhde,bche->bchd', W1, act)  # (B, cs, H, D)
+        err = y_pred - v_c                                   # (B, cs, H, D)
+
+        # --- Gradients w.r.t. W1: ∂loss/∂W1 = 2 * err ⊗ GELU(W2 @ k) ---
+        u_W1 = 2.0 * torch.einsum('bchd,bche->bchde', err, act)   # (B, cs, H, D, E)
+
+        # --- Gradients w.r.t. W2: chain rule through GELU and W1 ---
+        gelu_prime = _gelu_derivative(h)                           # (B, cs, H, E)
+        w1t_err = torch.einsum('bhde,bchd->bche', W1, err)        # (B, cs, H, E)
+        chain = w1t_err * gelu_prime                               # (B, cs, H, E)
+        u_W2 = 2.0 * torch.einsum('bche,bchd->bched', chain, k_c) # (B, cs, H, E, D)
+
+        # --- Omega rule: sliding window aggregation ---
+        if omega_window > 1 and g_c is not None:
+            u_W1 = _omega_aggregate(u_W1, g_c, omega_window)
+            u_W2 = _omega_aggregate(u_W2, g_c, omega_window)
+
+        theta = t_c.squeeze(-1)                                    # (B, cs, H)
+        alpha = a_c.squeeze(-1)                                    # (B, cs, H)
+
+        # --- Momentum + Polar Express + Memory scan for W1 ---
+        mom_W1 = -(e_c.unsqueeze(-1) * u_W1)                      # (B, cs, H, D, E)
+        chunk_S_W1, S_W1 = fused_linear_scan(S_W1, theta, mom_W1)
+        chunk_S_W1_orth = _pe(chunk_S_W1, ns_steps)
+        W1_all, W1 = fused_linear_scan(W1, alpha, chunk_S_W1_orth)
+
+        # --- Momentum + Polar Express + Memory scan for W2 ---
+        mom_W2 = -(e_c.unsqueeze(-1) * u_W2)                      # (B, cs, H, E, D)
+        chunk_S_W2, S_W2 = fused_linear_scan(S_W2, theta, mom_W2)
+        chunk_S_W2_orth = _pe(chunk_S_W2, ns_steps)
+        W2_all, W2 = fused_linear_scan(W2, alpha, chunk_S_W2_orth)
+
+        # --- Output: y_t = M_t(q_t) = q_t + W1_t @ GELU(W2_t @ q_t) ---
+        h_q = torch.einsum('bched,bchd->bche', W2_all, q_c)      # (B, cs, H, E)
+        g_q = F.gelu(h_q)                                          # (B, cs, H, E)
+        y_c = q_c + torch.einsum('bchde,bche->bchd', W1_all, g_q) # (B, cs, H, D)
+
+        return y_c, W1, W2, S_W1, S_W2
+
     def forward(self, x, memory_state=None):
         B, T, C = x.shape
         H, D = self.n_head, self.head_dim
+        E = self.expand_dim
         cs = self.chunk_size
 
         # Project and apply short causal convolution, then reshape to multi-head
@@ -182,17 +304,39 @@ class AtlasMemoryLayer(nn.Module):
         # Normalize queries and keys for stable memory operations
         q, k = norm(q), norm(k)
 
+        # Polynomial feature mapping on keys and queries
+        if self.poly_degree > 0:
+            q = self._poly_features(q)
+            k = self._poly_features(k)
+
         # Compute input-dependent gates via sigmoid -> (0, 1) range
         alpha = torch.sigmoid(self.gate_alpha(x)).view(B, T, H, 1)
         eta   = torch.sigmoid(self.gate_eta(x)).view(B, T, H, 1)
         theta = torch.sigmoid(self.gate_theta(x)).view(B, T, H, 1)
 
-        # Initialize or unpack memory state: M (memory matrix) and S (momentum)
+        # Omega rule context gates
+        gamma = None
+        if self.omega_window > 1:
+            gamma = torch.sigmoid(self.gate_gamma(x)).view(B, T, H, 1)
+
+        # Initialize or unpack memory state
         if memory_state is None:
-            M = torch.zeros(B, H, D, D, device=x.device, dtype=x.dtype)
-            S = torch.zeros(B, H, D, D, device=x.device, dtype=x.dtype)
+            if self.deep_memory:
+                W1 = torch.zeros(B, H, D, E, device=x.device, dtype=x.dtype)
+                # W2 initialized to [I; 0] so GELU(W2 @ k) ≠ 0, enabling learning from step 1
+                W2 = torch.zeros(B, H, E, D, device=x.device, dtype=x.dtype)
+                eye = torch.eye(min(E, D), device=x.device, dtype=x.dtype)
+                W2[:, :, :min(E, D), :min(E, D)] = eye
+                S_W1 = torch.zeros(B, H, D, E, device=x.device, dtype=x.dtype)
+                S_W2 = torch.zeros(B, H, E, D, device=x.device, dtype=x.dtype)
+            else:
+                M = torch.zeros(B, H, D, D, device=x.device, dtype=x.dtype)
+                S = torch.zeros(B, H, D, D, device=x.device, dtype=x.dtype)
         else:
-            M, S = memory_state
+            if self.deep_memory:
+                W1, W2, S_W1, S_W2 = memory_state
+            else:
+                M, S = memory_state
 
         # Pad sequence to a multiple of chunk_size
         T_orig = T
@@ -204,6 +348,8 @@ class AtlasMemoryLayer(nn.Module):
             alpha = F.pad(alpha, (0, 0, 0, 0, 0, pad), value=1.0)   # carry memory unchanged
             eta   = F.pad(eta,   (0, 0, 0, 0, 0, pad), value=0.0)   # no gradient update
             theta = F.pad(theta, (0, 0, 0, 0, 0, pad), value=0.0)   # kill momentum
+            if gamma is not None:
+                gamma = F.pad(gamma, (0, 0, 0, 0, 0, pad), value=0.0)
             T = q.shape[1]
 
         n_chunks = T // cs
@@ -213,16 +359,23 @@ class AtlasMemoryLayer(nn.Module):
             s, e = ci * cs, (ci + 1) * cs
             q_c, k_c, v_c = q[:, s:e], k[:, s:e], v[:, s:e]
             a_c, e_c, t_c = alpha[:, s:e], eta[:, s:e], theta[:, s:e]
+            g_c = gamma[:, s:e] if gamma is not None else None
 
-            # Checkpoint the entire chunk: during backward, only M and S (the inputs)
-            # are stored at chunk boundaries; all intra-chunk intermediates (gradient
-            # tensor u, momentum scan states, polar express iterations, memory scan
-            # states) are recomputed. This reduces activation memory from O(n_chunks *
-            # chunk_size * H * D²) to O(n_chunks * H * D²).
-            y_c, M, S = checkpoint(
-                self._process_chunk, M, S, q_c, k_c, v_c, a_c, e_c, t_c, self.ns_steps,
-                use_reentrant=False,
-            )
+            # Gradient checkpointing: only chunk-boundary states are stored;
+            # all intra-chunk intermediates are recomputed during backward.
+            if self.deep_memory:
+                y_c, W1, W2, S_W1, S_W2 = checkpoint(
+                    self._process_chunk_deep,
+                    W1, W2, S_W1, S_W2, q_c, k_c, v_c, a_c, e_c, t_c, g_c,
+                    self.ns_steps, self.omega_window, self.pe_ste,
+                    use_reentrant=False,
+                )
+            else:
+                y_c, M, S = checkpoint(
+                    self._process_chunk, M, S, q_c, k_c, v_c, a_c, e_c, t_c, g_c,
+                    self.ns_steps, self.omega_window, self.pe_ste,
+                    use_reentrant=False,
+                )
 
             outputs.append(y_c)
 
@@ -231,6 +384,8 @@ class AtlasMemoryLayer(nn.Module):
         y = y.contiguous().view(B, T_orig, -1)
         y = self.c_proj(y)
 
+        if self.deep_memory:
+            return y, (W1, W2, S_W1, S_W2)
         return y, (M, S)
 
 
@@ -261,22 +416,46 @@ class Block(nn.Module):
 
 
 class MemoryState:
-    """Holds per-layer memory (M) and momentum (S) matrices for inference.
+    """Holds per-layer memory and momentum matrices for inference.
     During training, states are created fresh per forward pass and discarded.
     During inference, this object persists across generate() calls."""
-    def __init__(self, n_layers, batch_size, n_head, head_dim, device, dtype):
+    def __init__(self, n_layers, batch_size, n_head, head_dim, device, dtype,
+                 deep_memory=False, expand_dim=None):
         self.n_layers = n_layers
-        self.M = [torch.zeros(batch_size, n_head, head_dim, head_dim, device=device, dtype=dtype)
-                   for _ in range(n_layers)]
-        self.S = [torch.zeros(batch_size, n_head, head_dim, head_dim, device=device, dtype=dtype)
-                   for _ in range(n_layers)]
+        self.deep_memory = deep_memory
+        if deep_memory:
+            E = expand_dim or head_dim
+            self.W1 = [torch.zeros(batch_size, n_head, head_dim, E, device=device, dtype=dtype)
+                       for _ in range(n_layers)]
+            self.W2 = []
+            for _ in range(n_layers):
+                w2 = torch.zeros(batch_size, n_head, E, head_dim, device=device, dtype=dtype)
+                eye = torch.eye(min(E, head_dim), device=device, dtype=dtype)
+                w2[:, :, :min(E, head_dim), :min(E, head_dim)] = eye
+                self.W2.append(w2)
+            self.S_W1 = [torch.zeros(batch_size, n_head, head_dim, E, device=device, dtype=dtype)
+                         for _ in range(n_layers)]
+            self.S_W2 = [torch.zeros(batch_size, n_head, E, head_dim, device=device, dtype=dtype)
+                         for _ in range(n_layers)]
+        else:
+            self.M = [torch.zeros(batch_size, n_head, head_dim, head_dim, device=device, dtype=dtype)
+                       for _ in range(n_layers)]
+            self.S = [torch.zeros(batch_size, n_head, head_dim, head_dim, device=device, dtype=dtype)
+                       for _ in range(n_layers)]
 
     def get_layer_state(self, layer_idx):
+        if self.deep_memory:
+            return (self.W1[layer_idx], self.W2[layer_idx],
+                    self.S_W1[layer_idx], self.S_W2[layer_idx])
         return (self.M[layer_idx], self.S[layer_idx])
 
-    def set_layer_state(self, layer_idx, M, S):
-        self.M[layer_idx] = M
-        self.S[layer_idx] = S
+    def set_layer_state(self, layer_idx, *state):
+        if self.deep_memory:
+            self.W1[layer_idx], self.W2[layer_idx] = state[0], state[1]
+            self.S_W1[layer_idx], self.S_W2[layer_idx] = state[2], state[3]
+        else:
+            self.M[layer_idx] = state[0]
+            self.S[layer_idx] = state[1]
 
 
 class Atlas(nn.Module):
@@ -320,6 +499,9 @@ class Atlas(nn.Module):
             torch.nn.init.normal_(mem.gate_alpha.weight, std=0.01)
             torch.nn.init.normal_(mem.gate_eta.weight, std=0.01)
             torch.nn.init.normal_(mem.gate_theta.weight, std=0.01)
+            if hasattr(mem, 'gate_gamma'):
+                torch.nn.init.normal_(mem.gate_gamma.weight, std=0.01)
+            # poly_coeffs: already initialized in __init__ to 1/i!
             # MLP
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
@@ -338,14 +520,14 @@ class Atlas(nn.Module):
         nparams_exclude = self.transformer.wte.weight.numel()  # embedding is a lookup, not a matmul
         H = self.config.n_head
         D = self.config.n_embd // H
-        # Per-token per-layer memory ops:
-        #   gradient: 2*H*D² (M@k matvec + outer product)
-        #   momentum scan: H*D² (element-wise on D×D state)
-        #   polar express: 3 matmuls/step × ns_steps × 2*H*D³ (D×D matrix multiplies)
-        #   memory scan: H*D² (element-wise on D×D state)
-        #   output: 2*H*D² (M@q matvec)
-        elementwise_flops = H * D * D * 5   # gradient + scans + output
-        ns_flops = 3 * self.config.ns_steps * 2 * H * D * D * D  # polar express matmuls
+        E = self.config.memory_expand * D if self.config.deep_memory else D
+        if self.config.deep_memory:
+            # Deep MLP memory: W1(D,E) and W2(E,D), dual scans, dual polar express
+            elementwise_flops = H * (D * E + E * D) * 5  # gradient + scans + output (×2 matrices)
+            ns_flops = 2 * 3 * self.config.ns_steps * 2 * H * max(D, E)**3  # PE on both
+        else:
+            elementwise_flops = H * D * D * 5
+            ns_flops = 3 * self.config.ns_steps * 2 * H * D * D * D
         memory_flops_per_token = elementwise_flops + ns_flops
         total_memory_flops = memory_flops_per_token * self.config.n_layer
         return 6 * (nparams - nparams_exclude) + total_memory_flops
@@ -420,9 +602,9 @@ class Atlas(nn.Module):
         # Forward through all blocks, threading memory state through each layer
         for i, block in enumerate(self.transformer.h):
             layer_state = memory_state.get_layer_state(i) if memory_state is not None else None
-            x, (new_M, new_S) = block(x, layer_state)
+            x, new_state = block(x, layer_state)
             if memory_state is not None:
-                memory_state.set_layer_state(i, new_M, new_S)
+                memory_state.set_layer_state(i, *new_state)
 
         x = norm(x)
 
@@ -453,7 +635,9 @@ class Atlas(nn.Module):
         # Initialize persistent memory state
         H = self.config.n_head
         D = self.config.n_embd // H
-        state = MemoryState(self.config.n_layer, 1, H, D, device, COMPUTE_DTYPE)
+        E = self.config.memory_expand * D if self.config.deep_memory else D
+        state = MemoryState(self.config.n_layer, 1, H, D, device, COMPUTE_DTYPE,
+                            deep_memory=self.config.deep_memory, expand_dim=E)
 
         # Prefill: process the full prompt, evolving memory over all positions
         ids = torch.tensor([tokens], dtype=torch.long, device=device)

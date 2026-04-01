@@ -241,17 +241,24 @@ def fused_polar_express(X, steps=5):
     """Fused Polar Express orthogonalization via Triton.
 
     Falls back to the standard PyTorch implementation if the Triton kernel
-    can't fit the D×D matrix in shared memory (GPU-dependent).
+    can't fit the matrix in shared memory (GPU-dependent) or if the matrix
+    is non-square (deep MLP memory with expansion > 1).
 
     Args:
-        X: (..., D, D) batch of square matrices
+        X: (..., D1, D2) batch of matrices (square or rectangular)
         steps: number of Newton-Schulz iterations
 
     Returns:
         Approximate orthogonal polar factor of each matrix.
     """
     global _PE_KERNEL_AVAILABLE
-    D = X.shape[-1]
+    D1, D2 = X.shape[-2], X.shape[-1]
+
+    # Non-square matrices: fall back to PyTorch (NS iteration works for rectangular)
+    if D1 != D2:
+        return _polar_express_pytorch(X, steps)
+
+    D = D1
     PAD_D = triton.next_power_of_2(D)
 
     # Check if kernel is available (cache result per D)
@@ -293,6 +300,30 @@ def _polar_express_pytorch(X, steps=5):
         B = b * A + c * (A @ A)
         X = a * X + B @ X
     return X
+
+
+class _PolarExpressSTE(torch.autograd.Function):
+    """Polar Express with Straight-Through Estimator for backward.
+
+    Forward: full Newton-Schulz orthogonalization via fused_polar_express.
+    Backward: pass gradients through unchanged (identity Jacobian approximation).
+
+    Justified because PE is an internal optimizer step finding the nearest
+    orthogonal matrix. Near-orthogonal matrices have Jacobian ≈ identity.
+    Eliminates 89%+ of backward FLOPs (30 cuBLAS matmuls per PE call)."""
+
+    @staticmethod
+    def forward(ctx, X, steps):
+        return fused_polar_express(X, steps)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output, None
+
+
+def polar_express_ste(X, steps=5):
+    """Polar Express with straight-through estimator for backward pass."""
+    return _PolarExpressSTE.apply(X, steps)
 
 
 def fused_linear_scan(h_init, gates, inputs):
