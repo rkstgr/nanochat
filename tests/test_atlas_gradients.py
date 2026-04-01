@@ -169,7 +169,7 @@ class TestProcessChunkGrad:
 
         def fn(M, S, q, k, v, a, e, t):
             y, M_new, S_new = AtlasMemoryLayer._process_chunk(
-                M, S, q, k, v, a, e, t, None, 2, 1)
+                M, S, q, k, v, a, e, t, None, 2, 1, use_pe_ste=False)
             return y, M_new, S_new
 
         assert torch.autograd.gradcheck(fn, (M, S, q, k, v, a, e, t), eps=1e-5, atol=1e-3)
@@ -189,7 +189,7 @@ class TestProcessChunkGrad:
 
         def fn(M, S, q, k, v, a, e, t, g):
             y, M_new, S_new = AtlasMemoryLayer._process_chunk(
-                M, S, q, k, v, a, e, t, g, 2, 3)
+                M, S, q, k, v, a, e, t, g, 2, 3, use_pe_ste=False)
             return y, M_new, S_new
 
         assert torch.autograd.gradcheck(fn, (M, S, q, k, v, a, e, t, g), eps=1e-5, atol=1e-3)
@@ -216,7 +216,7 @@ class TestProcessChunkDeepGrad:
 
         def fn(W1, W2, S_W1, S_W2, q, k, v, a, e, t):
             y, W1_n, W2_n, S1_n, S2_n = AtlasMemoryLayer._process_chunk_deep(
-                W1, W2, S_W1, S_W2, q, k, v, a, e, t, None, 2, 1)
+                W1, W2, S_W1, S_W2, q, k, v, a, e, t, None, 2, 1, use_pe_ste=False)
             return y, W1_n, W2_n, S1_n, S2_n
 
         assert torch.autograd.gradcheck(
@@ -241,7 +241,7 @@ class TestProcessChunkDeepGrad:
 
         def fn(W1, W2, S_W1, S_W2, q, k, v, a, e, t, g):
             y, W1_n, W2_n, S1_n, S2_n = AtlasMemoryLayer._process_chunk_deep(
-                W1, W2, S_W1, S_W2, q, k, v, a, e, t, g, 2, 3)
+                W1, W2, S_W1, S_W2, q, k, v, a, e, t, g, 2, 3, use_pe_ste=False)
             return y, W1_n, W2_n, S1_n, S2_n
 
         assert torch.autograd.gradcheck(

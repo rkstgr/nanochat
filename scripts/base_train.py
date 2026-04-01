@@ -60,6 +60,7 @@ parser.add_argument("--poly-degree", type=int, default=3, help="Atlas: polynomia
 parser.add_argument("--deep-memory", type=int, default=1, help="Atlas: use deep MLP memory (1) vs linear matrix (0)")
 parser.add_argument("--memory-expand", type=int, default=1, help="Atlas: MLP expansion factor for deep memory")
 parser.add_argument("--pe-ste", type=int, default=0, help="Atlas: Polar Express straight-through estimator (skip PE backward)")
+parser.add_argument("--use-checkpoint", type=int, default=1, help="Atlas: gradient checkpointing per chunk (required with torch.compile)")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
@@ -152,6 +153,7 @@ def build_model_meta(depth, model_type=None):
             omega_window=args.omega_window, poly_degree=args.poly_degree,
             deep_memory=bool(args.deep_memory), memory_expand=args.memory_expand,
             pe_ste=bool(args.pe_ste),
+            use_checkpoint=bool(args.use_checkpoint),
         )
         with torch.device("meta"):
             model_meta = Atlas(config)
@@ -269,13 +271,16 @@ orig_model = model # original, uncompiled model, for saving raw model state_dict
 if args.model == "atlas":
     # Atlas chunk loop (32 iterations with checkpoint) is too complex for full-model compile.
     # Instead, compile just the per-chunk processing function for kernel fusion.
+    # Skip compilation when pe_ste=True as the STE autograd function + Triton PE
+    # kernel branching causes torch.compile to hang during tracing.
     from nanochat.atlas import AtlasMemoryLayer
-    AtlasMemoryLayer._process_chunk = staticmethod(
-        torch.compile(AtlasMemoryLayer._process_chunk, dynamic=False)
-    )
-    AtlasMemoryLayer._process_chunk_deep = staticmethod(
-        torch.compile(AtlasMemoryLayer._process_chunk_deep, dynamic=False)
-    )
+    if not args.pe_ste:
+        AtlasMemoryLayer._process_chunk = staticmethod(
+            torch.compile(AtlasMemoryLayer._process_chunk, dynamic=False)
+        )
+        AtlasMemoryLayer._process_chunk_deep = staticmethod(
+            torch.compile(AtlasMemoryLayer._process_chunk_deep, dynamic=False)
+        )
     model = model
 else:
     model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe

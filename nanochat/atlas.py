@@ -51,6 +51,7 @@ class AtlasConfig:
     deep_memory: bool = True   # deep MLP memory vs linear matrix memory
     memory_expand: int = 1     # MLP expansion factor for deep memory (1 = D×D weights)
     pe_ste: bool = False       # Polar Express straight-through estimator (skip PE backward)
+    use_checkpoint: bool = True   # gradient checkpointing per chunk (required with torch.compile)
 
 
 def norm(x):
@@ -165,6 +166,7 @@ class AtlasMemoryLayer(nn.Module):
         self.memory_expand = config.memory_expand
         self.expand_dim = self.memory_expand * self.head_dim if self.deep_memory else self.head_dim
         self.pe_ste = config.pe_ste
+        self.use_checkpoint = config.use_checkpoint
         assert config.n_embd % config.n_head == 0
         assert config.omega_window <= config.chunk_size, \
             f"omega_window ({config.omega_window}) must be <= chunk_size ({config.chunk_size})"
@@ -361,21 +363,22 @@ class AtlasMemoryLayer(nn.Module):
             a_c, e_c, t_c = alpha[:, s:e], eta[:, s:e], theta[:, s:e]
             g_c = gamma[:, s:e] if gamma is not None else None
 
-            # Gradient checkpointing: only chunk-boundary states are stored;
-            # all intra-chunk intermediates are recomputed during backward.
             if self.deep_memory:
-                y_c, W1, W2, S_W1, S_W2 = checkpoint(
-                    self._process_chunk_deep,
-                    W1, W2, S_W1, S_W2, q_c, k_c, v_c, a_c, e_c, t_c, g_c,
-                    self.ns_steps, self.omega_window, self.pe_ste,
-                    use_reentrant=False,
-                )
+                args = (W1, W2, S_W1, S_W2, q_c, k_c, v_c, a_c, e_c, t_c, g_c,
+                        self.ns_steps, self.omega_window, self.pe_ste)
+                if self.use_checkpoint:
+                    y_c, W1, W2, S_W1, S_W2 = checkpoint(
+                        self._process_chunk_deep, *args, use_reentrant=False)
+                else:
+                    y_c, W1, W2, S_W1, S_W2 = self._process_chunk_deep(*args)
             else:
-                y_c, M, S = checkpoint(
-                    self._process_chunk, M, S, q_c, k_c, v_c, a_c, e_c, t_c, g_c,
-                    self.ns_steps, self.omega_window, self.pe_ste,
-                    use_reentrant=False,
-                )
+                args = (M, S, q_c, k_c, v_c, a_c, e_c, t_c, g_c,
+                        self.ns_steps, self.omega_window, self.pe_ste)
+                if self.use_checkpoint:
+                    y_c, M, S = checkpoint(
+                        self._process_chunk, *args, use_reentrant=False)
+                else:
+                    y_c, M, S = self._process_chunk(*args)
 
             outputs.append(y_c)
 
