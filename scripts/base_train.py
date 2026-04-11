@@ -26,7 +26,8 @@ import torch
 import torch.distributed as dist
 
 from nanochat.gpt import GPT, GPTConfig, Linear
-from nanochat.atlas import Atlas, AtlasConfig
+from nanochat.atlas import Atlas, AtlasConfig  # now wraps atlas-pytorch AtlasLMM
+from nanochat.mag import MAG, MAGConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
@@ -48,7 +49,7 @@ parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (e
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU and torchao)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
 # Model architecture
-parser.add_argument("--model", type=str, default="gpt", choices=["gpt", "atlas"], help="model architecture to train")
+parser.add_argument("--model", type=str, default="gpt", choices=["gpt", "atlas", "mag"], help="model architecture to train")
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
@@ -61,6 +62,7 @@ parser.add_argument("--deep-memory", type=int, default=1, help="Atlas: use deep 
 parser.add_argument("--memory-expand", type=int, default=1, help="Atlas: MLP expansion factor for deep memory")
 parser.add_argument("--pe-ste", type=int, default=0, help="Atlas: Polar Express straight-through estimator (skip PE backward)")
 parser.add_argument("--use-checkpoint", type=int, default=1, help="Atlas: gradient checkpointing per chunk (required with torch.compile)")
+parser.add_argument("--accelerated-scan", type=int, default=0, help="Atlas: use Triton accelerated associative scan (1=enable)")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
@@ -145,18 +147,27 @@ def build_model_meta(depth, model_type=None):
     base_dim = depth * args.aspect_ratio
     model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
     num_heads = model_dim // args.head_dim
-    if model_type == "atlas":
+    if model_type == "mag":
+        config = MAGConfig(
+            sequence_len=args.max_seq_len, vocab_size=vocab_size,
+            n_layer=depth, n_head=num_heads, n_embd=model_dim,
+            dim_head=args.head_dim,
+            omega_window=args.omega_window, poly_degree=args.poly_degree,
+        )
+        # atlas-pytorch models don't support meta device init
+        model_meta = MAG(config)
+        return model_meta
+    elif model_type == "atlas":
         config = AtlasConfig(
             sequence_len=args.max_seq_len, vocab_size=vocab_size,
             n_layer=depth, n_head=num_heads, n_embd=model_dim,
-            chunk_size=args.chunk_size, ns_steps=args.ns_steps,
+            dim_head=args.head_dim,
             omega_window=args.omega_window, poly_degree=args.poly_degree,
-            deep_memory=bool(args.deep_memory), memory_expand=args.memory_expand,
-            pe_ste=bool(args.pe_ste),
-            use_checkpoint=bool(args.use_checkpoint),
+            use_accelerated_scan=bool(args.accelerated_scan),
         )
-        with torch.device("meta"):
-            model_meta = Atlas(config)
+        # atlas-pytorch models don't support meta device init
+        model_meta = Atlas(config)
+        return model_meta
     else:
         config = GPTConfig(
             sequence_len=args.max_seq_len, vocab_size=vocab_size,
@@ -172,8 +183,12 @@ model = build_model_meta(args.depth) # 1) Build on meta device (only shapes/dtyp
 model_config = model.config
 model_config_kwargs = asdict(model_config)
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
-model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
-model.init_weights() # 3) All tensors get initialized
+if args.model in ("mag", "atlas"):
+    model.to(device)  # atlas-pytorch models build real tensors directly (no meta device)
+    model.init_weights()
+else:
+    model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
+    model.init_weights() # 3) All tensors get initialized
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
@@ -268,19 +283,8 @@ def disable_fp8(model):
 # Compile the model
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-if args.model == "atlas":
-    # Atlas chunk loop (32 iterations with checkpoint) is too complex for full-model compile.
-    # Instead, compile just the per-chunk processing function for kernel fusion.
-    # Skip compilation when pe_ste=True as the STE autograd function + Triton PE
-    # kernel branching causes torch.compile to hang during tracing.
-    from nanochat.atlas import AtlasMemoryLayer
-    if not args.pe_ste:
-        AtlasMemoryLayer._process_chunk = staticmethod(
-            torch.compile(AtlasMemoryLayer._process_chunk, dynamic=False)
-        )
-        AtlasMemoryLayer._process_chunk_deep = staticmethod(
-            torch.compile(AtlasMemoryLayer._process_chunk_deep, dynamic=False)
-        )
+if args.model in ("mag", "atlas"):
+    # atlas-pytorch models use internal memory operations — skip compilation
     model = model
 else:
     model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
@@ -506,8 +510,8 @@ while True:
             "If 5*x + 3 = 13, then x is",
         ]
         with disable_fp8(orig_model):
-            if args.model == "atlas":
-                # Atlas has its own generate method (recurrent, no KVCache)
+            if args.model in ("atlas", "mag"):
+                # Atlas/MAG have their own generate method (recurrent, no KVCache)
                 for prompt in prompts:
                     tokens = tokenizer(prompt, prepend="<|bos|>")
                     gen_tokens = list(orig_model.generate(tokens, max_tokens=16, temperature=0))
