@@ -174,14 +174,14 @@ class Atlas(nn.Module):
         for name, p in self.model.named_parameters():
             if id(p) in embed_ids or id(p) in head_ids:
                 continue
-            # memory_model.model.weights are updated by the memory mechanism, not backprop
-            if 'memory_model.model.weights' in name:
+            # memory_model internals + omega_gate are updated by the memory mechanism, not backprop
+            if 'memory_model.' in name or '_omega_gate_' in name:
                 memory_model_params.append(p)
                 continue
             if p.ndim == 2 and min(p.shape) >= 64:
                 matrix_params.append(p)
-            elif p.shape[0] < max(world_size, 4):
-                tiny_params.append(p)
+            elif p.shape[0] < max(world_size, 4) or (world_size > 1 and p.shape[0] % world_size != 0):
+                tiny_params.append(p)  # too small or indivisible for reduce_scatter
             else:
                 small_params.append(p)
 
@@ -189,7 +189,7 @@ class Atlas(nn.Module):
         total_count = len(list(self.parameters()))
         assert all_count == total_count, f"Parameter grouping mismatch: {all_count} vs {total_count}"
         if memory_model_params:
-            print0(f"Atlas: excluding {len(memory_model_params)} memory_model.model.weights from optimizer (updated by memory mechanism)")
+            print0(f"Atlas: excluding {len(memory_model_params)} internal memory params from optimizer (updated by memory mechanism)")
 
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print0(f"Atlas: Scaling LR ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")

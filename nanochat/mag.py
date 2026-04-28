@@ -213,8 +213,8 @@ class MAG(nn.Module):
                 continue
             if p.ndim == 2 and min(p.shape) >= 64:
                 matrix_params.append(p)
-            elif p.shape[0] < max(world_size, 4):
-                tiny_params.append(p)  # too small for reduce_scatter
+            elif p.shape[0] < max(world_size, 4) or (world_size > 1 and p.shape[0] % world_size != 0):
+                tiny_params.append(p)  # too small or indivisible for reduce_scatter
             else:
                 small_params.append(p)
 
